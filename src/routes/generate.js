@@ -9,6 +9,7 @@ const { generateLimiter } = require('../middleware/rateLimits');
 const { getUserBalance, debitCredits } = require('../services/creditLedger');
 const { generateImage } = require('../services/siliconFlow');
 const { uploadImage, getSignedUrl, getPublicUrl } = require('../services/r2Storage');
+const { syncSubscriberTier } = require('../services/revenueCat');
 const db = require('../config/database');
 
 const router = express.Router();
@@ -54,7 +55,17 @@ router.post(
     }
 
     const { prompt } = value;
-    const { user } = req;
+    let { user } = req;
+
+    // ----- Verify subscription tier against RevenueCat (source of truth) -----
+    // RC is queried on every generation request so a lapsed subscription is
+    // caught immediately. Falls back to the cached DB tier if RC is unreachable.
+    try {
+      const rcTier = await syncSubscriberTier(user.id);
+      user = { ...user, tier: rcTier };
+    } catch (err) {
+      console.warn('[generate] RevenueCat sync failed — using cached DB tier:', err.message);
+    }
 
     // Mode is auto-detected: image attached = image-to-image, otherwise text-to-image
     const hasImage = !!req.file;

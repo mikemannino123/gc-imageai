@@ -30,15 +30,7 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 // ---------------------------------------------------------------------------
 // Body parsers
-//
-// IMPORTANT: Stripe webhooks require the RAW body for signature verification.
-// Mount the raw-body middleware BEFORE express.json() for the webhook route.
 // ---------------------------------------------------------------------------
-app.use(
-  '/subscriptions/stripe/webhook',
-  express.raw({ type: 'application/json' })
-);
-
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 

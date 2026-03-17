@@ -82,23 +82,19 @@ CREATE TABLE IF NOT EXISTS credit_ledger (
 
 -- ---------------------------------------------------------------------------
 -- Subscriptions
+-- Managed entirely by RevenueCat. One row per user (upserted on each event).
+-- RevenueCat is the source of truth; this table is a cache for fast reads.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS subscriptions (
-  id                              UUID                PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id                         UUID                NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  tier                            user_tier           NOT NULL,
-  status                          subscription_status NOT NULL DEFAULT 'active',
-  -- Stripe fields (web/server-side billing)
-  stripe_subscription_id          VARCHAR(255)        UNIQUE,
-  stripe_customer_id              VARCHAR(255),
-  -- StoreKit fields (iOS in-app purchase)
-  storekit_original_transaction_id VARCHAR(255)       UNIQUE,
-  storekit_product_id             VARCHAR(255),
-  current_period_start            TIMESTAMPTZ,
-  current_period_end              TIMESTAMPTZ,
-  cancelled_at                    TIMESTAMPTZ,
-  created_at                      TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
-  updated_at                      TIMESTAMPTZ         NOT NULL DEFAULT NOW()
+  id                    UUID                PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id               UUID                NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  tier                  user_tier           NOT NULL,
+  status                subscription_status NOT NULL DEFAULT 'active',
+  entitlement           VARCHAR(100),        -- RC entitlement identifier: 'pro' or 'ultra'
+  revenuecat_product_id VARCHAR(255),        -- product_id from RC event/subscriber
+  expires_date          TIMESTAMPTZ,
+  created_at            TIMESTAMPTZ         NOT NULL DEFAULT NOW(),
+  updated_at            TIMESTAMPTZ         NOT NULL DEFAULT NOW()
 );
 
 -- ---------------------------------------------------------------------------
@@ -124,12 +120,6 @@ CREATE INDEX IF NOT EXISTS idx_generations_status
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id
   ON subscriptions(user_id);
-
-CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_id
-  ON subscriptions(stripe_subscription_id);
-
-CREATE INDEX IF NOT EXISTS idx_subscriptions_storekit_id
-  ON subscriptions(storekit_original_transaction_id);
 
 CREATE INDEX IF NOT EXISTS idx_subscriptions_status
   ON subscriptions(status);

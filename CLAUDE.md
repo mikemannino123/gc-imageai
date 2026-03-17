@@ -36,8 +36,7 @@ Read this file at the start of every session. It contains the full project conte
 | Auth | Apple Sign-In + JWT (30-day expiry) |
 | Image generation | SiliconFlow — FLUX.1-Kontext-pro |
 | Image storage | Cloudflare R2 (S3-compatible) |
-| Payments (iOS) | StoreKit 2 |
-| Payments (server) | Stripe |
+| Payments (iOS + server) | RevenueCat (SDK + REST API) |
 | Hosting | Railway |
 
 ---
@@ -46,6 +45,7 @@ Read this file at the start of every session. It contains the full project conte
 
 ### Phase 1 — Backend (COMPLETE)
 Full Node.js + Express API. See details below.
+RevenueCat integrated for all subscription and IAP handling. Stripe and raw StoreKit code removed.
 
 ### Phase 2 — iMessage Extension (NEXT)
 The Xcode work. Targets:
@@ -55,6 +55,7 @@ The Xcode work. Targets:
 - Keychain: store and retrieve JWT securely
 - Apple Sign-In: lightweight flow inside the extension to get a JWT (full onboarding is Phase 3)
 - Image insert: download the returned image URL → insert into `MSConversation` active draft as `MSMessage` or `MSSticker`
+- RevenueCat iOS SDK: call `Purchases.shared.logIn(appUserID: user.id)` immediately after sign-in so RC can link purchases to our user IDs
 
 ### Phase 3 — Parent App
 - Onboarding screens
@@ -93,8 +94,8 @@ gc-imageai-backend/
 │   │   ├── auth.js                   POST /auth/apple, GET /auth/me
 │   │   ├── generate.js               POST /generate
 │   │   ├── users.js                  GET /users/me, GET /users/me/history
-│   │   ├── subscriptions.js          POST /subscriptions/storekit/verify
-│   │   │                             POST /subscriptions/stripe/webhook
+│   │   ├── subscriptions.js          POST /subscriptions/revenuecat/sync
+│   │   │                             POST /subscriptions/revenuecat/webhook
 │   │   │                             GET  /subscriptions/current
 │   │   └── admin.js                  GET /admin (dashboard HTML)
 │   │                                 GET /admin/api/stats
@@ -105,8 +106,8 @@ gc-imageai-backend/
 │       ├── appleAuth.js              Verify Apple identity token via JWKS
 │       ├── creditLedger.js           getUserBalance, debitCredits, creditUser, etc.
 │       ├── r2Storage.js              uploadImage, getSignedUrl, getPublicUrl, getBestUrl
-│       ├── siliconFlow.js            generateImage(prompt, referenceImageUrl?)
-│       └── stripeService.js          Stripe webhook event handlers
+│       ├── revenueCat.js             getSubscriberInfo, syncSubscriberTier, verifyWebhookAuth
+│       └── siliconFlow.js            generateImage(prompt, referenceImageUrl?)
 ├── migrations/
 │   └── 001_initial_schema.sql        All tables, enums, indexes, triggers
 ├── scripts/
@@ -158,18 +159,17 @@ gc-imageai-backend/
 | created_at | TIMESTAMPTZ | |
 
 ### `subscriptions`
+One row per user — upserted on each RevenueCat webhook or sync call. RC is the source of truth; this is a cache for fast reads.
+
 | Column | Type | Notes |
 |---|---|---|
 | id | UUID PK | |
-| user_id | UUID FK → users | |
+| user_id | UUID FK → users UNIQUE | One subscription record per user |
 | tier | ENUM | `pro` / `ultra` |
 | status | ENUM | `active` / `cancelled` / `expired` / `past_due` |
-| stripe_subscription_id | VARCHAR UNIQUE | Nullable |
-| stripe_customer_id | VARCHAR | Nullable |
-| storekit_original_transaction_id | VARCHAR UNIQUE | Nullable |
-| storekit_product_id | VARCHAR | Nullable |
-| current_period_start / end | TIMESTAMPTZ | |
-| cancelled_at | TIMESTAMPTZ | |
+| entitlement | VARCHAR | RC entitlement identifier: `pro` or `ultra` |
+| revenuecat_product_id | VARCHAR | Product ID from RC event |
+| expires_date | TIMESTAMPTZ | When the current period ends |
 | created_at / updated_at | TIMESTAMPTZ | |
 
 ---
@@ -205,9 +205,9 @@ Mode is **auto-detected** from whether a file is attached — no `type` field ne
 ### Subscriptions
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| POST | `/subscriptions/storekit/verify` | JWT | Body: `{ signedTransaction }` (JWSTransaction from StoreKit 2) |
-| POST | `/subscriptions/stripe/webhook` | Stripe sig | Raw body required — wired in app.js before JSON parser |
-| GET | `/subscriptions/current` | JWT | Returns active subscription or null |
+| POST | `/subscriptions/revenuecat/sync` | JWT | Called by iOS app after purchase; pulls latest state from RC REST API |
+| POST | `/subscriptions/revenuecat/webhook` | RC secret | Receives real-time events from RevenueCat |
+| GET | `/subscriptions/current` | JWT | Returns cached subscription record from DB |
 
 ### Admin
 All admin routes require `X-Admin-Key: <ADMIN_SECRET_KEY>` header (or `?key=` query param for the dashboard URL).
@@ -265,22 +265,40 @@ All admin routes require `X-Admin-Key: <ADMIN_SECRET_KEY>` header (or `?key=` qu
 - Issues our own 30-day JWT on success
 - Env var: `APPLE_APP_BUNDLE_ID`
 
-### StoreKit 2 — iOS In-App Purchases
-- App sends `signedTransaction` (JWSTransaction from StoreKit 2) to `POST /subscriptions/storekit/verify`
-- Backend verifies JWS against Apple's JWKS (same `jwks-rsa` client, ES256)
-- Extracts `productId`, `originalTransactionId`, `expiresDate`, `purchaseDate`
-- Maps product ID → tier via `STOREKIT_PRODUCT_PRO` / `STOREKIT_PRODUCT_ULTRA` env vars
-- On new subscription: creates subscription record + upgrades user tier + tops up 50 credits
-- On renewal: updates period dates + tops up 50 credits again
-- Env vars: `STOREKIT_PRODUCT_PRO`, `STOREKIT_PRODUCT_ULTRA`
+### RevenueCat — All Subscription & IAP Handling
+RevenueCat replaces all custom Stripe and StoreKit code. It handles receipt validation with Apple, subscription lifecycle, and renewals.
 
-### Stripe — Server-Side Billing
-- Webhook at `POST /subscriptions/stripe/webhook` (raw body, verified with `stripe-signature` header)
-- Handled events: `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.payment_succeeded`
-- `invoice.payment_succeeded` with `billing_reason = subscription_cycle` triggers monthly credit top-up (50 credits)
-- User lookup from Stripe customer metadata (`userId` field set at customer creation)
-- Price ID → tier mapping via `STRIPE_PRICE_PRO` / `STRIPE_PRICE_ULTRA` env vars
-- Env vars: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_PRO`, `STRIPE_PRICE_ULTRA`
+**iOS SDK** (Phase 2):
+- `Purchases.configure(withAPIKey: "test_DSVjgvqfgizAaTiaIsfcgzqzcua")` on app launch
+- `Purchases.shared.logIn(appUserID: user.id)` immediately after Apple Sign-In — this links purchases to our user UUID
+- After a purchase completes, call `POST /subscriptions/revenuecat/sync` to update the backend
+
+**Backend REST API** (`src/services/revenueCat.js`):
+- Base URL: `https://api.revenuecat.com/v1`
+- `GET /subscribers/{userId}` — fetch subscriber info; our user UUID is the RC app user ID
+- `syncSubscriberTier(userId)` — calls RC, updates `users.tier` + `subscriptions` table if changed, returns authoritative tier
+- Called on every `POST /generate` request so stale subscription state is never acted on
+
+**Webhooks** (`POST /subscriptions/revenuecat/webhook`):
+- Authenticated via `Authorization` header matching `REVENUECAT_WEBHOOK_SECRET`
+- Webhook URL to configure in RC dashboard: `https://your-domain.com/subscriptions/revenuecat/webhook`
+- Handled events:
+
+| Event | Action |
+|---|---|
+| `INITIAL_PURCHASE` | Upgrade tier + top up 50 credits (atomic transaction) |
+| `RENEWAL` | Refresh `expires_date` + top up 50 credits |
+| `PRODUCT_CHANGE` | Update tier |
+| `CANCELLATION` | Mark subscription `cancelled` (tier stays until expiry) |
+| `UNCANCELLATION` | Mark subscription `active` |
+| `EXPIRATION` | Mark `expired` + downgrade user to `free` |
+| `BILLING_ISSUE` | Mark `past_due` |
+
+**Entitlements** (must match RC dashboard configuration):
+- `pro` → Pro tier ($6.99/month)
+- `ultra` → Ultra tier ($12.99/month)
+
+**Env vars**: `REVENUECAT_SECRET_KEY`, `REVENUECAT_WEBHOOK_SECRET`, `REVENUECAT_ENTITLEMENT_PRO`, `REVENUECAT_ENTITLEMENT_ULTRA`
 
 ---
 
@@ -306,13 +324,11 @@ R2_PUBLIC_URL                         Optional CDN domain (e.g. https://images.y
 
 SILICONFLOW_API_KEY                   sk-...
 
-STRIPE_SECRET_KEY                     sk_test_... or sk_live_...
-STRIPE_WEBHOOK_SECRET                 whsec_...
-STRIPE_PRICE_PRO                      price_...
-STRIPE_PRICE_ULTRA                    price_...
-
-STOREKIT_PRODUCT_PRO                  com.yourcompany.gcimageai.pro_monthly
-STOREKIT_PRODUCT_ULTRA                com.yourcompany.gcimageai.ultra_monthly
+REVENUECAT_SECRET_KEY                 sk_... (from RC Dashboard → API Keys → Secret keys)
+REVENUECAT_WEBHOOK_SECRET             random string — set same value in RC Dashboard → Webhooks
+REVENUECAT_ENTITLEMENT_PRO            pro
+REVENUECAT_ENTITLEMENT_ULTRA          ultra
+# Note: RC public API key (test_DSVjgvqfgizAaTiaIsfcgzqzcua) goes in the iOS app, not here
 
 ADMIN_SECRET_KEY                      32-byte hex secret
 CORS_ORIGIN                           * in dev, restrict in prod
@@ -337,8 +353,8 @@ The generation flow is: check balance → create pending record → call Silicon
 ### Stripe webhook returns 200 even on handler errors
 If a Stripe event handler throws, we log it but still return HTTP 200. This prevents Stripe from retrying indefinitely for errors that won't self-resolve (e.g. user not found). Permanent failures go to logs for manual investigation.
 
-### StoreKit 2 only (not legacy receipts)
-The app is built fresh on Swift 5.9 so we use StoreKit 2's JWSTransaction verification, not the older `verifyReceipt` endpoint. Backend verifies the JWS using Apple's JWKS (ES256).
+### RevenueCat handles all subscription and IAP logic
+Custom StoreKit and Stripe subscription code has been removed entirely. RevenueCat is the single source of truth for subscription state. The backend uses RC's REST API to verify tier before every generation request (`syncSubscriberTier`), and RC webhooks keep the DB in sync for lifecycle events (purchase, renewal, expiry, etc.). The `stripe` npm package has been removed from the project.
 
 ### Admin dashboard is inline HTML
 The admin dashboard is a single dark-themed HTML page rendered directly from `src/routes/admin.js` as a template string. No separate frontend build. It loads stats and tables dynamically via fetch against `/admin/api/*`. Protected by `ADMIN_SECRET_KEY` via `X-Admin-Key` header or `?key=` query param.
@@ -379,3 +395,11 @@ open http://localhost:3000/admin?key=<ADMIN_SECRET_KEY>
 5. Apple Sign-In: minimal flow inside extension to exchange identity token for JWT and store in Keychain
 
 iOS bundle ID must match `APPLE_APP_BUNDLE_ID` on the backend exactly.
+
+**RevenueCat setup checklist before testing Phase 2:**
+- [ ] Create entitlements named exactly `pro` and `ultra` in RC dashboard
+- [ ] Attach App Store products to each entitlement
+- [ ] Configure webhook URL: `https://your-domain/subscriptions/revenuecat/webhook`
+- [ ] Set a webhook secret in RC dashboard and add to `REVENUECAT_WEBHOOK_SECRET` in `.env`
+- [ ] iOS SDK: `Purchases.configure(withAPIKey: "test_DSVjgvqfgizAaTiaIsfcgzqzcua")` on launch
+- [ ] iOS SDK: `Purchases.shared.logIn(appUserID: user.id)` after sign-in

@@ -1,203 +1,225 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
-const jwksClient = require('jwks-rsa');
 const { requireAuth } = require('../middleware/auth');
 const { topUpForSubscription } = require('../services/creditLedger');
-const {
-  constructWebhookEvent,
-  handleSubscriptionCreated,
-  handleSubscriptionUpdated,
-  handleSubscriptionDeleted,
-  handleInvoicePaymentSucceeded,
-} = require('../services/stripeService');
+const { syncSubscriberTier, verifyWebhookAuth, getTierFromEntitlements, getSubscriberInfo } = require('../services/revenueCat');
 const db = require('../config/database');
 
 const router = express.Router();
 
-// Apple's JWKS endpoint for verifying StoreKit 2 JWS transactions
-const appleStoreKitJwks = jwksClient({
-  jwksUri: 'https://appleid.apple.com/auth/keys',
-  cache: true,
-  cacheMaxAge: 24 * 60 * 60 * 1000,
-});
-
-function getStoreKitSigningKey(header, callback) {
-  appleStoreKitJwks.getSigningKey(header.kid, (err, key) => {
-    if (err) return callback(err);
-    callback(null, key.getPublicKey());
-  });
-}
-
-/**
- * Verifies a StoreKit 2 signed transaction (JWS) from Apple.
- * Returns the decoded transaction payload.
- */
-function verifyStoreKitTransaction(signedTransaction) {
-  return new Promise((resolve, reject) => {
-    jwt.verify(
-      signedTransaction,
-      getStoreKitSigningKey,
-      { algorithms: ['ES256'] },
-      (err, payload) => {
-        if (err) reject(err);
-        else resolve(payload);
-      }
-    );
-  });
-}
-
-// Map StoreKit product IDs → internal tiers
-function tierFromProductId(productId) {
-  if (productId === process.env.STOREKIT_PRODUCT_PRO) return 'pro';
-  if (productId === process.env.STOREKIT_PRODUCT_ULTRA) return 'ultra';
-  return null;
-}
-
 // ---------------------------------------------------------------------------
-// StoreKit 2 — iOS in-app purchase verification
+// POST /subscriptions/revenuecat/sync
+//
+// Called by the iOS app after a RevenueCat purchase completes.
+// Pulls the latest subscriber state from RevenueCat, updates the user's tier
+// in our DB, and returns the current tier + credit balance.
+//
+// The iOS SDK should call Purchases.shared.logIn(appUserID: user.id) after
+// sign-in so that RevenueCat can associate purchases with our user IDs.
 // ---------------------------------------------------------------------------
-
-/**
- * POST /subscriptions/storekit/verify
- *
- * Called by the iOS app after a successful StoreKit 2 purchase.
- * Body: { signedTransaction }  (the JWSTransaction string from StoreKit)
- */
-router.post('/storekit/verify', requireAuth, async (req, res) => {
-  const { signedTransaction } = req.body;
-  if (!signedTransaction) {
-    return res.status(400).json({ error: { code: 'MISSING_TRANSACTION', message: 'signedTransaction is required' } });
-  }
-
-  let txn;
-  try {
-    txn = await verifyStoreKitTransaction(signedTransaction);
-  } catch (err) {
-    return res.status(400).json({ error: { code: 'INVALID_TRANSACTION', message: 'StoreKit transaction verification failed' } });
-  }
-
-  const { productId, originalTransactionId, expiresDate, purchaseDate } = txn;
-  const tier = tierFromProductId(productId);
-
-  if (!tier) {
-    return res.status(400).json({ error: { code: 'UNKNOWN_PRODUCT', message: 'Unrecognized product ID' } });
-  }
-
+router.post('/revenuecat/sync', requireAuth, async (req, res) => {
   const userId = req.user.id;
+  const previousTier = req.user.tier;
 
-  // Check if we've already processed this original transaction
-  const { rows: existing } = await db.query(
-    'SELECT id FROM subscriptions WHERE storekit_original_transaction_id = $1',
-    [originalTransactionId]
+  let currentTier;
+  try {
+    currentTier = await syncSubscriberTier(userId);
+  } catch (err) {
+    console.error('[subscriptions/sync] RevenueCat error:', err.message);
+    return res.status(502).json({
+      error: { code: 'RC_UNAVAILABLE', message: 'Could not reach RevenueCat to verify subscription' },
+    });
+  }
+
+  // Award credits if this is a new paid subscription activation
+  // (tier went from free → paid, or this is a fresh monthly renewal)
+  if (currentTier !== 'free' && previousTier === 'free') {
+    try {
+      await topUpForSubscription(userId, currentTier, `rc_sync_${Date.now()}`);
+    } catch (err) {
+      // Non-fatal — credits can be granted manually via admin if needed
+      console.error('[subscriptions/sync] Credit top-up failed:', err.message);
+    }
+  }
+
+  const { rows } = await db.query(
+    'SELECT COALESCE(SUM(amount), 0)::int AS balance FROM credit_ledger WHERE user_id = $1',
+    [userId]
   );
 
-  const client = await db.getClient();
-  try {
-    await client.query('BEGIN');
-
-    if (existing.length) {
-      // Renewal — update period dates
-      await client.query(
-        `UPDATE subscriptions SET
-           status = 'active',
-           current_period_start = to_timestamp($1 / 1000.0),
-           current_period_end   = to_timestamp($2 / 1000.0),
-           storekit_product_id  = $3,
-           tier = $4,
-           updated_at = NOW()
-         WHERE storekit_original_transaction_id = $5`,
-        [purchaseDate, expiresDate, productId, tier, originalTransactionId]
-      );
-      await topUpForSubscription(userId, tier, originalTransactionId, client);
-    } else {
-      // New subscription
-      await client.query(
-        `INSERT INTO subscriptions
-           (user_id, tier, status, storekit_original_transaction_id, storekit_product_id,
-            current_period_start, current_period_end)
-         VALUES ($1, $2, 'active', $3, $4, to_timestamp($5 / 1000.0), to_timestamp($6 / 1000.0))`,
-        [userId, tier, originalTransactionId, productId, purchaseDate, expiresDate]
-      );
-      await topUpForSubscription(userId, tier, originalTransactionId, client);
-    }
-
-    // Upgrade user tier
-    await client.query('UPDATE users SET tier = $1 WHERE id = $2', [tier, userId]);
-
-    await client.query('COMMIT');
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[subscriptions/storekit]', err.message);
-    return res.status(500).json({ error: { code: 'SERVER_ERROR', message: 'Failed to activate subscription' } });
-  } finally {
-    client.release();
-  }
-
-  const { rows } = await db.query('SELECT tier FROM users WHERE id = $1', [userId]);
-  res.json({ tier: rows[0].tier, message: 'Subscription activated' });
+  res.json({
+    tier: currentTier,
+    creditBalance: rows[0].balance,
+    upgraded: currentTier !== previousTier,
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Stripe webhook — must use raw body for signature verification
+// POST /subscriptions/revenuecat/webhook
+//
+// Receives real-time subscription events from RevenueCat.
+// Configure the webhook URL in RevenueCat Dashboard → Project Settings → Webhooks.
+// Set a webhook secret there and add it to REVENUECAT_WEBHOOK_SECRET in .env.
+//
+// Handled event types:
+//   INITIAL_PURCHASE  — new subscriber, top up credits + upgrade tier
+//   RENEWAL           — monthly renewal, top up credits
+//   PRODUCT_CHANGE    — plan change (pro ↔ ultra), update tier
+//   CANCELLATION      — user cancelled (still active until period end)
+//   UNCANCELLATION    — user un-cancelled
+//   EXPIRATION        — subscription expired, downgrade to free
+//   BILLING_ISSUE     — payment failed, mark past_due
 // ---------------------------------------------------------------------------
-
-/**
- * POST /subscriptions/stripe/webhook
- *
- * Receives Stripe events. Express must NOT parse the body as JSON for this
- * route — raw body is required for signature verification.
- * Configured in app.js with express.raw({ type: 'application/json' }).
- */
-router.post('/stripe/webhook', async (req, res) => {
-  const signature = req.headers['stripe-signature'];
-  if (!signature) {
-    return res.status(400).json({ error: { code: 'MISSING_SIGNATURE', message: 'Stripe signature header missing' } });
+router.post('/revenuecat/webhook', async (req, res) => {
+  // Verify the request is actually from RevenueCat
+  if (!verifyWebhookAuth(req.headers['authorization'])) {
+    return res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid webhook secret' } });
   }
 
-  let event;
-  try {
-    event = constructWebhookEvent(req.body, signature);
-  } catch (err) {
-    return res.status(400).json({ error: { code: 'INVALID_SIGNATURE', message: 'Stripe signature verification failed' } });
+  const event = req.body?.event;
+  if (!event) {
+    return res.status(400).json({ error: { code: 'INVALID_PAYLOAD', message: 'Missing event object' } });
   }
 
+  const { type, app_user_id: userId, entitlement_ids, product_id, expiration_at_ms } = event;
+
+  if (!userId) {
+    // Anonymous or aliased user — skip; will be resolved on next sync
+    return res.json({ received: true });
+  }
+
+  // Confirm the user exists in our DB
+  const { rows: userRows } = await db.query('SELECT id, tier FROM users WHERE id = $1', [userId]);
+  if (!userRows.length) {
+    // User not found — could be a test event or a user who deleted their account
+    return res.json({ received: true });
+  }
+
+  const currentDbTier = userRows[0].tier;
+
+  // Derive the new tier from the entitlement identifiers sent in the event
+  const entitlementTier = (() => {
+    if (!entitlement_ids?.length) return null;
+    if (entitlement_ids.includes('ultra')) return 'ultra';
+    if (entitlement_ids.includes('pro')) return 'pro';
+    return null;
+  })();
+
+  const expiresDate = expiration_at_ms ? new Date(expiration_at_ms).toISOString() : null;
+
   try {
-    switch (event.type) {
-      case 'customer.subscription.created':
-        await handleSubscriptionCreated(event.data.object);
+    switch (type) {
+      case 'INITIAL_PURCHASE': {
+        if (!entitlementTier) break;
+        const client = await db.getClient();
+        try {
+          await client.query('BEGIN');
+          await client.query('UPDATE users SET tier = $1 WHERE id = $2', [entitlementTier, userId]);
+          await client.query(
+            `INSERT INTO subscriptions (user_id, tier, status, entitlement, revenuecat_product_id, expires_date)
+             VALUES ($1, $2, 'active', $3, $4, $5)
+             ON CONFLICT (user_id) DO UPDATE SET
+               tier = EXCLUDED.tier, status = 'active', entitlement = EXCLUDED.entitlement,
+               revenuecat_product_id = EXCLUDED.revenuecat_product_id,
+               expires_date = EXCLUDED.expires_date, updated_at = NOW()`,
+            [userId, entitlementTier, entitlementTier, product_id, expiresDate]
+          );
+          await topUpForSubscription(userId, entitlementTier, `rc_initial_${event.id}`, client);
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        } finally {
+          client.release();
+        }
         break;
-      case 'customer.subscription.updated':
-        await handleSubscriptionUpdated(event.data.object);
+      }
+
+      case 'RENEWAL': {
+        if (!entitlementTier) break;
+        // Top up credits and refresh expiry
+        const client = await db.getClient();
+        try {
+          await client.query('BEGIN');
+          await client.query(
+            `UPDATE subscriptions SET expires_date = $1, status = 'active', updated_at = NOW()
+             WHERE user_id = $2`,
+            [expiresDate, userId]
+          );
+          await topUpForSubscription(userId, entitlementTier, `rc_renewal_${event.id}`, client);
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        } finally {
+          client.release();
+        }
         break;
-      case 'customer.subscription.deleted':
-        await handleSubscriptionDeleted(event.data.object);
+      }
+
+      case 'PRODUCT_CHANGE': {
+        if (!entitlementTier) break;
+        await db.query('UPDATE users SET tier = $1 WHERE id = $2', [entitlementTier, userId]);
+        await db.query(
+          `UPDATE subscriptions SET tier = $1, entitlement = $1, updated_at = NOW() WHERE user_id = $2`,
+          [entitlementTier, userId]
+        );
         break;
-      case 'invoice.payment_succeeded':
-        await handleInvoicePaymentSucceeded(event.data.object);
+      }
+
+      case 'CANCELLATION':
+        // Subscription is cancelled but still active until period end — don't downgrade yet
+        await db.query(
+          `UPDATE subscriptions SET status = 'cancelled', updated_at = NOW() WHERE user_id = $1`,
+          [userId]
+        );
         break;
+
+      case 'UNCANCELLATION':
+        await db.query(
+          `UPDATE subscriptions SET status = 'active', updated_at = NOW() WHERE user_id = $1`,
+          [userId]
+        );
+        break;
+
+      case 'EXPIRATION':
+        // Subscription fully expired — downgrade to free
+        await db.query(
+          `UPDATE subscriptions SET status = 'expired', updated_at = NOW() WHERE user_id = $1`,
+          [userId]
+        );
+        await db.query("UPDATE users SET tier = 'free' WHERE id = $1", [userId]);
+        break;
+
+      case 'BILLING_ISSUE':
+        await db.query(
+          `UPDATE subscriptions SET status = 'past_due', updated_at = NOW() WHERE user_id = $1`,
+          [userId]
+        );
+        break;
+
       default:
-        // Acknowledge unhandled events without error
+        // Acknowledge unhandled event types (TRANSFER, SUBSCRIBER_ALIAS, etc.)
         break;
     }
+
     res.json({ received: true });
   } catch (err) {
-    console.error('[stripe/webhook] Handler error for', event.type, ':', err.message);
-    // Return 200 to prevent Stripe from retrying a permanent failure;
-    // log it for manual investigation
-    res.json({ received: true, warning: 'Handler encountered an error' });
+    console.error(`[revenuecat/webhook] Handler error for ${type}:`, err.message);
+    // Return 200 so RevenueCat doesn't retry indefinitely for non-transient errors
+    res.json({ received: true, warning: 'Handler error — check server logs' });
   }
 });
 
-/**
- * GET /subscriptions/current
- * Returns the user's current active subscription (if any).
- */
+// ---------------------------------------------------------------------------
+// GET /subscriptions/current
+// Returns the user's current subscription record from our DB.
+// ---------------------------------------------------------------------------
 router.get('/current', requireAuth, async (req, res) => {
   try {
     const { rows } = await db.query(
-      `SELECT tier, status, current_period_start, current_period_end, created_at
+      `SELECT tier, status, entitlement, revenuecat_product_id, expires_date, created_at
        FROM subscriptions
-       WHERE user_id = $1 AND status = 'active'
+       WHERE user_id = $1
        ORDER BY created_at DESC LIMIT 1`,
       [req.user.id]
     );

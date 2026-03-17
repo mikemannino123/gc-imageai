@@ -73,11 +73,14 @@ Xcode project scaffolded at `GCImageAI/`. Generated via XcodeGen 2.45.3.
 - ✅ `GCImageAI.xcodeproj` — generated, ready to open in Xcode
 
 **What's left for Phase 2:**
-- [ ] Open in Xcode, set Development Team in Signing & Capabilities for both targets
-- [ ] Add app to Apple Developer portal with correct bundle IDs
-- [ ] Enable iMessage extension capability in the developer portal
-- [ ] Run on device or simulator to test sign-in + generation flow
-- [ ] Replace `localhost:3000` with Railway production URL before TestFlight
+- ⏳ Apple Developer Program membership — enrollment submitted, pending activation (can take up to 48 hours)
+- [ ] Once membership activates: register bundle IDs in Apple Developer portal
+  - `com.michaelmannino.gcimageai` (app)
+  - `com.michaelmannino.gcimageai.messages` (iMessage extension)
+- [ ] Enable iMessage App capability for `com.michaelmannino.gcimageai` in the portal
+- [ ] Open `GCImageAI/GCImageAI.xcodeproj` in Xcode, set Development Team in Signing & Capabilities for both targets
+- [ ] Run on device or simulator to test sign-in + generation flow end to end
+- [ ] Replace `localhost:3000` baseURL with Railway production URL before TestFlight
 
 ### Phase 3 — Parent App
 - Onboarding screens

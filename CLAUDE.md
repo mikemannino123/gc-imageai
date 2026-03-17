@@ -21,7 +21,7 @@ Read this file at the start of every session. It contains the full project conte
 - 1 credit = 1 text-to-image generation
 - 2 credits = 1 image-to-image generation (Ultra only)
 - Credits are managed server-side; the client never touches credit logic directly
-- Apple takes 30% of StoreKit purchases; Stripe handles web/server-side billing
+- All IAP handled by RevenueCat (iOS SDK + backend REST API). No custom StoreKit or Stripe code.
 
 ---
 
@@ -47,15 +47,37 @@ Read this file at the start of every session. It contains the full project conte
 Full Node.js + Express API. See details below.
 RevenueCat integrated for all subscription and IAP handling. Stripe and raw StoreKit code removed.
 
-### Phase 2 — iMessage Extension (NEXT)
-The Xcode work. Targets:
-- New Xcode project with a Messages Extension target embedded inside a parent app target
-- Main extension UI: prompt text field, optional image picker (Ultra only), Generate button, loading/spinner state, image preview
-- Networking layer: `POST /generate` with JWT auth, multipart when image attached
-- Keychain: store and retrieve JWT securely
-- Apple Sign-In: lightweight flow inside the extension to get a JWT (full onboarding is Phase 3)
-- Image insert: download the returned image URL → insert into `MSConversation` active draft as `MSMessage` or `MSSticker`
-- RevenueCat iOS SDK: call `Purchases.shared.logIn(appUserID: user.id)` immediately after sign-in so RC can link purchases to our user IDs
+### Phase 2 — iMessage Extension (IN PROGRESS — SCAFFOLD COMPLETE)
+Xcode project scaffolded at `GCImageAI/`. Generated via XcodeGen 2.45.3.
+
+**Targets:**
+- `GCImageAI` — parent SwiftUI app (iOS 17+)
+- `GCImageAIMessages` — iMessage App Extension (MSMessagesAppViewController)
+- `Shared/` — shared Swift files compiled into both targets (no framework)
+
+**What's built:**
+- ✅ `Shared/Models.swift` — User, UserTier, GenerationResponse, MeResponse, AuthResponse, APIError
+- ✅ `Shared/Keychain.swift` — save/load/delete JWT and userId in Keychain (shared access group)
+- ✅ `Shared/APIClient.swift` — full networking layer: appleSignIn, getMe, generate (text + multipart), syncSubscription, history
+- ✅ `Shared/AuthManager.swift` — ObservableObject, Apple Sign-In delegate, Keychain persistence
+- ✅ `GCImageAI/GCImageAIApp.swift` — RevenueCat configure + logIn on launch
+- ✅ `GCImageAI/SignInView.swift` — SwiftUI Apple Sign-In screen
+- ✅ `GCImageAI/ContentView.swift` — TabView (Account + History tabs)
+- ✅ `GCImageAI/AccountView.swift` — profile, credits, subscription, sign out
+- ✅ `GCImageAI/HistoryView.swift` — 2-column grid of past generations
+- ✅ `GCImageAIMessages/MessagesViewController.swift` — MSMessagesAppViewController; routes to sign-in or generator
+- ✅ `GCImageAIMessages/GeneratorViewController.swift` — UIKit host for GeneratorView; downloads image and inserts attachment into MSConversation
+- ✅ `GCImageAIMessages/GeneratorView.swift` — SwiftUI: prompt input, PhotosPicker (Ultra only), Generate button, credit counter
+- ✅ `GCImageAIMessages/ExtensionSignInViewController.swift` — UIKit Apple Sign-In inside extension
+- ✅ `project.yml` — XcodeGen spec; RevenueCat SPM dependency; entitlements; keychain-access-groups
+- ✅ `GCImageAI.xcodeproj` — generated, ready to open in Xcode
+
+**What's left for Phase 2:**
+- [ ] Open in Xcode, set Development Team in Signing & Capabilities for both targets
+- [ ] Add app to Apple Developer portal with correct bundle IDs
+- [ ] Enable iMessage extension capability in the developer portal
+- [ ] Run on device or simulator to test sign-in + generation flow
+- [ ] Replace `localhost:3000` with Railway production URL before TestFlight
 
 ### Phase 3 — Parent App
 - Onboarding screens
@@ -75,6 +97,36 @@ The Xcode work. Targets:
 - Production Railway deploy
 - Production Stripe + SiliconFlow keys
 - Monitor admin dashboard
+
+---
+
+## iOS — File Structure
+
+```
+GCImageAI/
+├── project.yml                             XcodeGen spec (source of truth for .xcodeproj)
+├── GCImageAI.xcodeproj                     Generated — open this in Xcode
+├── Shared/                                 Compiled into BOTH targets
+│   ├── Models.swift                        User, Generation, MeResponse, AuthResponse, APIError
+│   ├── Keychain.swift                      JWT + userId stored in shared Keychain group
+│   ├── APIClient.swift                     All backend calls; baseURL switches DEBUG/prod
+│   └── AuthManager.swift                  ObservableObject; Apple Sign-In delegate
+├── GCImageAI/                              Parent app target
+│   ├── GCImageAIApp.swift                  @main; RC configure + logIn
+│   ├── SignInView.swift                    SwiftUI Apple Sign-In onboarding
+│   ├── ContentView.swift                   TabView (Account + History)
+│   ├── AccountView.swift                   Profile, credits, subscription, sign out
+│   ├── HistoryView.swift                   2-col grid of past generations
+│   ├── GCImageAI.entitlements             Apple Sign-In + keychain-access-groups
+│   └── Assets.xcassets/
+├── GCImageAIMessages/                      iMessage extension target
+│   ├── MessagesViewController.swift        MSMessagesAppViewController entry point
+│   ├── GeneratorViewController.swift       UIKit host; MSConversation.insertAttachment
+│   ├── GeneratorView.swift                 SwiftUI: prompt + image picker + generate
+│   ├── ExtensionSignInViewController.swift UIKit Apple Sign-In (extension context)
+│   ├── GCImageAIMessages.entitlements     Shared keychain-access-groups
+│   └── Assets.xcassets/
+```
 
 ---
 

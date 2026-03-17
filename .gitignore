@@ -4,3 +4,13 @@ node_modules/
 .DS_Store
 dist/
 coverage/
+
+# Xcode
+GCImageAI/GCImageAI.xcodeproj/xcuserdata/
+GCImageAI/GCImageAI.xcodeproj/project.xcworkspace/xcuserdata/
+GCImageAI/GCImageAI.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+GCImageAI/build/
+GCImageAI/DerivedData/
+*.xccheckout
+*.moved-aside
+*.xcuserstate

@@ -1,0 +1,105 @@
+name: GCImageAI
+options:
+  bundleIdPrefix: com.michaelmannino
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16"
+  createIntermediateGroups: true
+
+packages:
+  RevenueCat:
+    url: https://github.com/RevenueCat/purchases-ios
+    from: 5.0.0
+
+targets:
+
+  # -------------------------------------------------------------------------
+  # Parent App
+  # -------------------------------------------------------------------------
+  GCImageAI:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: GCImageAI
+        excludes:
+          - "**/*.md"
+      - path: Shared
+    resources:
+      - path: GCImageAI/Assets.xcassets
+    info:
+      path: GCImageAI/Info.plist
+      properties:
+        CFBundleDisplayName: GC ImageAI
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen:
+          UIColorName: ""
+        NSPhotoLibraryUsageDescription: "Choose a reference photo for image-to-image generation."
+        NSPhotoLibraryAddUsageDescription: "Save generated images to your photo library."
+        UIApplicationSupportsIndirectInputEvents: true
+        UIRequiredDeviceCapabilities:
+          - armv7
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: GCImageAI/GCImageAI.entitlements
+      properties:
+        com.apple.developer.applesignin:
+          - Default
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.michaelmannino.gcimageai
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.michaelmannino.gcimageai
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ENABLE_PREVIEWS: YES
+    dependencies:
+      - package: RevenueCat
+        product: RevenueCat
+
+  # -------------------------------------------------------------------------
+  # iMessage App Extension
+  # -------------------------------------------------------------------------
+  GCImageAIMessages:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: GCImageAIMessages
+        excludes:
+          - "**/*.md"
+      - path: Shared
+    resources:
+      - path: GCImageAIMessages/Assets.xcassets
+    info:
+      path: GCImageAIMessages/Info.plist
+      properties:
+        CFBundleDisplayName: GC ImageAI
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.message-payload-provider
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).MessagesViewController
+        NSPhotoLibraryUsageDescription: "Choose a reference photo for image-to-image generation."
+    entitlements:
+      path: GCImageAIMessages/GCImageAIMessages.entitlements
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.michaelmannino.gcimageai
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.michaelmannino.gcimageai.messages
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    dependencies:
+      - target: GCImageAI
+        embed: false
